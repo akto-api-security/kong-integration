@@ -13,6 +13,9 @@ return {
 
           -- Mode: "async" (non-blocking) or "blocked" (blocking)
           { mode = { type = "string", required = true, default = "async", one_of = { "async", "blocked" } } },
+
+          -- Timeout in milliseconds for guardrail service and upstream calls
+          { timeout = { type = "number", required = false, default = 30000 } },
         },
       },
     },

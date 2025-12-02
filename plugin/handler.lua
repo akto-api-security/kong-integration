@@ -40,7 +40,7 @@ local function store_response_body()
 end
 
 -- Helper function to make HTTP requests to the Go service
-local function call_go_service(service_url, endpoint, payload)
+local function call_go_service(service_url, endpoint, payload, timeout_ms)
   local httpc = http.new()
 
   -- Parse service URL to get host and port
@@ -50,8 +50,8 @@ local function call_go_service(service_url, endpoint, payload)
     port = service_url:match("^https://") and "443" or "80"
   end
 
-  -- Set default timeouts (30 seconds)
-  local timeout = 30000
+  -- Use provided timeout or default to 30 seconds
+  local timeout = timeout_ms or 30000
   local connect_timeout = math.floor(timeout / 3)
   local send_timeout = math.floor(timeout / 3)
   local read_timeout = timeout - connect_timeout - send_timeout
@@ -115,156 +115,185 @@ function AktoMCPEndpointShieldHandler:access(conf)
   -- Store request body for later use
   store_request_body()
 
-  -- For blocked mode, process request synchronously and block if needed
+  -- For blocked mode, proxy entire request/response through guardrail service
   if conf.mode == "blocked" then
-    self:process_request_blocked(conf)
+    self:process_blocked_mode_proxy(conf)
   end
   -- For async mode, we'll process everything in log phase (non-blocking)
 end
 
--- Process request in BLOCKED mode (synchronous, blocks bad requests)
-function AktoMCPEndpointShieldHandler:process_request_blocked(conf)
+-- Process BLOCKED mode by manually proxying and validating both request and response
+function AktoMCPEndpointShieldHandler:process_blocked_mode_proxy(conf)
   local request_body = ngx.ctx.mcp_request_body or ""
+  local request_headers = kong.request.get_headers()
+  local request_method = kong.request.get_method()
+  local request_path = kong.request.get_path()
+  local query_params = kong.request.get_query()
 
-  -- Prepare payload for Go service
-  local payload = {
+  -- Step 1: Validate request first
+  local request_payload = {
     request_body = request_body,
-    request_headers = kong.request.get_headers(),
+    request_headers = request_headers,
+    query_params = query_params,
     ip = kong.client.get_forwarded_ip() or kong.client.get_ip(),
-    method = kong.request.get_method(),
-    endpoint = kong.request.get_path(),
+    method = request_method,
+    endpoint = request_path,
     mode = conf.mode,
   }
 
-  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Processing request")
+  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Validating request")
 
-  -- Call Go service synchronously to check request
-  local result, err = call_go_service(
+  local request_result, err = call_go_service(
     conf.service_url,
     "/process/request",
-    payload
+    request_payload,
+    conf.timeout
   )
 
   if err then
-    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Error processing request: ", err)
-    -- Fail-open: Continue on error
+    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Error validating request: ", err)
+    -- Fail-open: Continue with normal proxy
     return
   end
 
-  -- Check if request should be blocked
-  if result.is_blocked then
+  -- If request is blocked, stop here
+  if request_result and request_result.is_blocked then
     kong.log.warn("[akto-mcp-endpoint-shield] [BLOCKED MODE] Request BLOCKED by guardrail")
 
-    -- Return custom blocked response from guardrail service
-    local blocked_response = result.blocked_response or {
+    local blocked_response = request_result.blocked_response or {
       error = "Request blocked by guardrails",
       message = "Your request was blocked due to security policies"
     }
 
-    -- Stop here - don't send request to upstream
     return kong.response.exit(403, blocked_response)
   end
 
-  -- Check if request should be modified
-  if result.modified_payload and result.modified_payload ~= "" then
+  -- If request should be modified, update it
+  local forward_body = request_body
+  if request_result and request_result.modified_payload and request_result.modified_payload ~= "" then
     kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Request modified by guardrail")
-    kong.service.request.set_raw_body(result.modified_payload)
+    forward_body = request_result.modified_payload
+    kong.service.request.set_raw_body(forward_body)
   end
 
-  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Request is ALLOWED, forwarding to upstream")
-  -- Request is allowed, continue to upstream
-end
+  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Request validated")
 
--- Header filter phase: Enable response buffering
-function AktoMCPEndpointShieldHandler:header_filter(conf)
-  -- Enable buffering for both modes (blocked needs to modify, async needs to read)
-  kong.response.get_source() -- This triggers buffering
-end
+  -- Step 2: Manually call upstream service to get response
+  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Calling upstream service")
 
--- Body filter phase: Store response body and process in blocked mode
-function AktoMCPEndpointShieldHandler:body_filter(conf)
-  -- Store response body chunks for both modes
-  store_response_body()
+  local httpc = http.new()
+  local upstream_timeout = conf.timeout or 30000
+  httpc:set_timeouts(upstream_timeout, upstream_timeout, upstream_timeout)
 
-  -- Only process in blocked mode
-  if conf.mode ~= "blocked" then
+  -- Get upstream service details from Kong
+  local service = kong.router.get_service()
+  local upstream_host = service and service.host or "host.docker.internal"
+  local upstream_port = service and service.port or 3000
+
+  local ok, err = httpc:connect(upstream_host, upstream_port)
+  if not ok then
+    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Failed to connect to upstream: ", err)
+    -- Fail-open: continue with normal proxy
     return
   end
 
-  -- Only process once all body chunks have been received (eof)
-  if not ngx.arg[2] then
+  local res, err = httpc:request({
+    method = request_method,
+    path = request_path,
+    body = forward_body,
+    headers = request_headers,
+  })
+
+  if not res then
+    httpc:close()
+    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Failed to call upstream: ", err)
+    -- Fail-open: continue with normal proxy
     return
   end
 
-  -- Mark that we've already processed
-  if ngx.ctx.mcp_response_processed then
+  local response_body, err = res:read_body()
+  local response_status = res.status
+  local response_headers = res.headers
+
+  httpc:close()
+
+  if not response_body then
+    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Failed to read upstream response: ", err)
+    -- Fail-open: continue with normal proxy
     return
   end
-  ngx.ctx.mcp_response_processed = true
 
-  -- Process response now
-  self:process_response_blocked(conf)
-end
+  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Got upstream response, validating")
 
--- Process response in BLOCKED mode (synchronous, can block bad responses)
-function AktoMCPEndpointShieldHandler:process_response_blocked(conf)
-  local request_body = ngx.ctx.mcp_request_body or ""
-  local response_body = store_response_body()
-
-  local payload = {
-    request_body = request_body,
+  -- Step 3: Validate response
+  local response_payload = {
+    request_body = forward_body,
     response_body = response_body,
-    request_headers = kong.request.get_headers(),
-    response_headers = kong.response.get_headers(),
-    status_code = kong.response.get_status(),
+    request_headers = request_headers,
+    response_headers = response_headers,
+    query_params = query_params,
+    status_code = response_status,
     ip = kong.client.get_forwarded_ip() or kong.client.get_ip(),
-    method = kong.request.get_method(),
-    endpoint = kong.request.get_path(),
+    method = request_method,
+    endpoint = request_path,
     mode = conf.mode,
   }
 
-  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Processing response")
-
-  local result, err = call_go_service(
+  local response_result, err = call_go_service(
     conf.service_url,
     "/process/response",
-    payload
+    response_payload,
+    conf.timeout
   )
 
   if err then
-    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Error processing response: ", err)
-    -- Fail-open: Continue on error
-    return
+    kong.log.err("[akto-mcp-endpoint-shield] [BLOCKED MODE] Error validating response: ", err)
+    -- Fail-open: return original response
+    return kong.response.exit(response_status, response_body, response_headers)
   end
 
   -- Check if response should be blocked
-  if result.is_blocked then
+  if response_result and response_result.is_blocked then
     kong.log.warn("[akto-mcp-endpoint-shield] [BLOCKED MODE] Response BLOCKED by guardrail")
 
-    -- Return custom blocked response from guardrail service
-    local blocked_response = result.blocked_response or {
+    local blocked_response = response_result.blocked_response or {
       error = "Response blocked by guardrails",
       message = "The response was blocked due to security policies"
     }
 
-    -- Replace the upstream response with custom blocked response
     return kong.response.exit(403, blocked_response)
   end
 
   -- Check if response should be modified
-  if result.modified_payload and result.modified_payload ~= "" then
+  if response_result and response_result.modified_payload and response_result.modified_payload ~= "" then
     kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Response modified by guardrail")
-    -- Replace response body with sanitized version
-    kong.response.set_raw_body(result.modified_payload)
+    return kong.response.exit(response_status, response_result.modified_payload, response_headers)
   end
 
-  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Response is ALLOWED, sending to client")
-  -- Response is allowed, send to client
+  kong.log.info("[akto-mcp-endpoint-shield] [BLOCKED MODE] Response is clean, sending to client")
+  -- Return original response
+  return kong.response.exit(response_status, response_body, response_headers)
 end
 
--- Log phase: Process in ASYNC mode (background, non-blocking)
+-- Header filter phase: Enable response buffering for async mode
+function AktoMCPEndpointShieldHandler:header_filter(conf)
+  -- Only enable buffering for async mode (blocked mode handles everything in access phase)
+  if conf.mode == "async" then
+    kong.response.get_source() -- This triggers buffering
+  end
+end
+
+-- Body filter phase: Store response body for async mode
+function AktoMCPEndpointShieldHandler:body_filter(conf)
+  -- Only capture response for async mode (blocked mode already handled in access phase)
+  if conf.mode == "async" then
+    store_response_body()
+  end
+end
+
+-- Log phase: Process in ASYNC mode only (blocked mode handled in access phase)
 function AktoMCPEndpointShieldHandler:log(conf)
-  -- Only process in async mode (blocked mode already processed in access/response phases)
+  -- Only process in async mode
   if conf.mode ~= "async" then
     return
   end
@@ -297,11 +326,13 @@ function AktoMCPEndpointShieldHandler:log(conf)
   -- Kong PDK functions are NOT available inside ngx.timer.at
   local request_headers = kong.request.get_headers()
   local response_headers = kong.response.get_headers()
+  local query_params = kong.request.get_query()
   local client_ip = kong.client.get_forwarded_ip() or kong.client.get_ip()
   local request_method = kong.request.get_method()
   local request_path = kong.request.get_path()
   local response_status = kong.response.get_status()
   local service_url = conf.service_url
+  local timeout_ms = conf.timeout
 
   -- Log captured headers with ERROR level
   local req_hdr_count = 0
@@ -323,21 +354,24 @@ function AktoMCPEndpointShieldHandler:log(conf)
   ngx.log(ngx.ERR, "[MCP-SHIELD] Request path: ", request_path)
   ngx.log(ngx.ERR, "[MCP-SHIELD] Request method: ", request_method)
 
+  local mode = conf.mode
+
   -- Process in background using ngx.timer.at
   local ok, err = ngx.timer.at(0, function(premature)
     if premature then
-      ngx.log(ngx.ERR, "[akto-mcp-endpoint-shield] [ASYNC MODE] Timer premature exit")
+      ngx.log(ngx.ERR, "[akto-mcp-endpoint-shield] [", string.upper(mode), " MODE] Timer premature exit")
       return
     end
 
-    ngx.log(ngx.INFO, "[akto-mcp-endpoint-shield] [ASYNC MODE] Background timer executing")
+    ngx.log(ngx.INFO, "[akto-mcp-endpoint-shield] [", string.upper(mode), " MODE] Background timer executing")
 
-    -- Process both request and response in one call
+    -- ASYNC MODE: Process both request and response together
     local both_payload = {
       request_body = request_body,
       response_body = response_body,
       request_headers = request_headers,
       response_headers = response_headers,
+      query_params = query_params,
       status_code = response_status,
       ip = client_ip,
       method = request_method,
@@ -349,7 +383,8 @@ function AktoMCPEndpointShieldHandler:log(conf)
     local result, err = call_go_service(
       service_url,
       "/process/both",
-      both_payload
+      both_payload,
+      timeout_ms
     )
 
     if err then
@@ -363,13 +398,13 @@ function AktoMCPEndpointShieldHandler:log(conf)
       ngx.log(ngx.INFO, "[akto-mcp-endpoint-shield] [ASYNC MODE] Total time: ", tostring(result.total_time_ms), "ms")
     end
 
-    ngx.log(ngx.INFO, "[akto-mcp-endpoint-shield] [ASYNC MODE] Background processing completed")
+    ngx.log(ngx.INFO, "[akto-mcp-endpoint-shield] [", string.upper(mode), " MODE] Background processing completed")
   end)
 
   if not ok then
-    kong.log.err("[akto-mcp-endpoint-shield] [ASYNC MODE] Failed to create background timer: ", err)
+    kong.log.err("[akto-mcp-endpoint-shield] [", string.upper(mode), " MODE] Failed to create background timer: ", err)
   else
-    kong.log.info("[akto-mcp-endpoint-shield] [ASYNC MODE] Background timer created successfully")
+    kong.log.info("[akto-mcp-endpoint-shield] [", string.upper(mode), " MODE] Background timer created successfully")
   end
 end
 
