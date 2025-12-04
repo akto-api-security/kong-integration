@@ -43,11 +43,12 @@ end
 local function call_go_service(service_url, endpoint, payload, timeout_ms)
   local httpc = http.new()
 
-  -- Parse service URL to get host and port
+  -- Parse service URL to get host, port, and scheme
+  local is_https = service_url:match("^https://") ~= nil
   local host, port = service_url:match("^https?://([^:]+):(%d+)")
   if not host or not port then
     host = service_url:match("^https?://([^:/]+)")
-    port = service_url:match("^https://") and "443" or "80"
+    port = is_https and "443" or "80"
   end
 
   -- Use provided timeout or default to 30 seconds
@@ -62,6 +63,15 @@ local function call_go_service(service_url, endpoint, payload, timeout_ms)
   local ok, err = httpc:connect(host, tonumber(port))
   if not ok then
     return nil, "Failed to connect to Go service at " .. host .. ":" .. port .. ": " .. (err or "unknown error")
+  end
+
+  -- Perform SSL handshake if HTTPS
+  if is_https then
+    local session, err = httpc:ssl_handshake(nil, host, false)
+    if not session then
+      httpc:close()
+      return nil, "Failed to perform SSL handshake with " .. host .. ":" .. port .. ": " .. (err or "unknown error")
+    end
   end
 
   local body = cjson.encode(payload)
